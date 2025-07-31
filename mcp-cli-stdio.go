@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
 )
 
@@ -59,31 +60,31 @@ func startInteractiveSession() {
 	}
 	defer out.Close()
 
-	inWriter := bufio.NewWriter(in)
-	outReader := bufio.NewReader(out)
-	inputScanner := bufio.NewScanner(os.Stdin)
+	inWriter := json.NewEncoder(in)
+	outReader := json.NewDecoder(out)
+	liner := liner.NewLiner()
+	defer liner.Close()
+	liner.SetCtrlCAborts(true)
 
 	fmt.Println("MCP CLI started. Type JSON-RPC messages / Ctrl + C to exit")
 
 	for {
-		fmt.Print("> ")
-		if !inputScanner.Scan() {
+		line, err := liner.Prompt("> ")
+		if err != nil {
 			break
 		}
-
-		line := inputScanner.Text()
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
+		liner.AppendHistory(line)
 
 		parsed, err := parseLineToJSONRPC(line)
 		if err != nil {
 			fmt.Println("❌ Error:", err)
 			continue
 		}
-
 		if parsed == "" {
-			// e.g., describe returned nothing to send
 			continue
 		}
 
@@ -94,26 +95,20 @@ func startInteractiveSession() {
 		}
 
 		fmt.Println("sending parsed JSON:", parsed)
-		_, err = inWriter.WriteString(parsed + "\n")
-		if err != nil {
+		if err := inWriter.Encode(js); err != nil {
 			fmt.Println("Error writing to MCP:", err)
 			continue
 		}
-		inWriter.Flush()
 
-		response, err := outReader.ReadBytes('\n')
-		if err != nil {
+		var pretty map[string]interface{}
+		if err := outReader.Decode(&pretty); err != nil {
 			fmt.Println("Error reading from MCP:", err)
 			continue
 		}
-
 		fmt.Println("Response:")
-		var pretty map[string]interface{}
-		json.Unmarshal(response, &pretty)
 		prettyBytes, _ := json.MarshalIndent(pretty, "", "  ")
 		fmt.Println(string(prettyBytes))
 
-		// cache tools if it's a tools/list response
 		if result, ok := pretty["result"]; ok {
 			if tools, ok := result.(map[string]interface{})["tools"].([]interface{}); ok {
 				cachedTools = map[string]Tool{}
@@ -133,7 +128,6 @@ func startInteractiveSession() {
 		}
 	}
 }
-
 func parseLineToJSONRPC(line string) (string, error) {
 	fields := strings.Fields(line)
 	if len(fields) == 0 {
@@ -150,7 +144,7 @@ func parseLineToJSONRPC(line string) (string, error) {
 			for name := range cachedTools {
 				fmt.Printf("- %s\n", name)
 			}
-			return "", nil // Don't send anything to MCP
+			return "", nil
 		}
 		return `{"jsonrpc":"2.0","method":"tools/list","id":"1"}`, nil
 
@@ -190,7 +184,6 @@ func parseLineToJSONRPC(line string) (string, error) {
 			toolName := strings.TrimPrefix(line, "describe ")
 			return describeTool(toolName)
 		}
-		// Treat as raw JSON
 		return line, nil
 	}
 }
@@ -210,7 +203,7 @@ func promptForToolCall(toolName string) (string, error) {
 		val := inputScanner.Text()
 		var parsed interface{}
 		if err := json.Unmarshal([]byte(val), &parsed); err != nil {
-			parsed = val // fallback to string
+			parsed = val
 		}
 		args[key] = parsed
 	}
@@ -249,11 +242,11 @@ func describeTool(toolName string) (string, error) {
 	fmt.Println("Input Example JSON:")
 	printExampleJSON(tool.Schema)
 
-	return "", nil // don't send anything to server
+	return "", nil
 }
 
 func printExampleJSON(schema map[string]interface{}) {
-	example := buildExampleFromSchema(schema, schema) // root = schema
+	example := buildExampleFromSchema(schema, schema)
 	bytes, err := json.MarshalIndent(example, "", "  ")
 	if err != nil {
 		fmt.Println("❌ Failed to marshal:", err)
@@ -263,7 +256,6 @@ func printExampleJSON(schema map[string]interface{}) {
 	fmt.Println(string(bytes))
 }
 
-// buildExampleFromSchema recursively builds a mock object based on the input schema.
 func buildExampleFromSchema(schema map[string]interface{}, root map[string]interface{}) interface{} {
 	if ref, ok := schema["$ref"].(string); ok {
 		return buildExampleFromSchema(resolveRef(ref, root), root)
@@ -335,7 +327,6 @@ func describeProperties(schema map[string]interface{}, prefix string, depth int)
 			fmt.Printf("%s  ↳ enum: %v\n", indent, enum)
 		}
 
-		// recurse if it's a nested object
 		if typ == "object" {
 			describeProperties(prop, fieldPath, depth+1)
 		}
@@ -352,15 +343,10 @@ func buildExampleTyped(schema map[string]interface{}, root map[string]interface{
 
 	for name, raw := range props {
 		prop := raw.(map[string]interface{})
-
-		// Resolve $ref if needed
 		if ref, ok := prop["$ref"].(string); ok {
 			prop = resolveRef(ref, root)
 		}
-
 		typ, _ := prop["type"].(string)
-
-		// Handle enums
 		if enumList, ok := prop["enum"].([]interface{}); ok && len(enumList) > 0 {
 			obj[name] = enumList[0]
 			continue
@@ -383,7 +369,6 @@ func buildExampleTyped(schema map[string]interface{}, root map[string]interface{
 			obj[name] = "any"
 		}
 	}
-
 	return obj
 }
 
@@ -393,7 +378,6 @@ func resolveRef(ref string, root map[string]interface{}) map[string]interface{} 
 		return map[string]interface{}{}
 	}
 
-	// Split path: e.g. "#/properties/value/properties/subject"
 	path := strings.Split(ref[2:], "/")
 	current := root
 	for i, part := range path {
@@ -401,7 +385,6 @@ func resolveRef(ref string, root map[string]interface{}) map[string]interface{} 
 		unescaped = strings.ReplaceAll(unescaped, "~0", "~")
 
 		if next, ok := current[unescaped]; ok {
-			// If we're not at the end, continue walking
 			if m, ok := next.(map[string]interface{}); ok || i < len(path)-1 {
 				current = m
 			} else {
@@ -412,6 +395,5 @@ func resolveRef(ref string, root map[string]interface{}) map[string]interface{} 
 			return map[string]interface{}{}
 		}
 	}
-
 	return current
 }
