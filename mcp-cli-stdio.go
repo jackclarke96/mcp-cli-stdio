@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"syscall"
@@ -66,6 +67,11 @@ func startInteractiveSession() {
 		if line == "" {
 			continue
 		}
+		var js map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &js); err != nil {
+			fmt.Println("Invalid JSON:", err)
+			continue
+		}
 
 		_, err := inWriter.WriteString(line + "\n")
 		if err != nil {
@@ -80,6 +86,9 @@ func startInteractiveSession() {
 			continue
 		}
 		fmt.Println("Response:")
-		fmt.Println(string(response))
+		var pretty map[string]interface{}
+		json.Unmarshal(response, &pretty)
+		prettyBytes, _ := json.MarshalIndent(pretty, "", "  ")
+		fmt.Println(string(prettyBytes))
 	}
 }
