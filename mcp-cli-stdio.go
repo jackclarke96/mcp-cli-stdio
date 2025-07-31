@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -58,7 +59,7 @@ func startInteractiveSession() {
 	fmt.Println("MCP CLI started. Type JSON-RPC messages/ Ctrl + c to exit")
 
 	for {
-		fmt.Println("> ")
+		fmt.Print("> ")
 		if !inputScanner.Scan() {
 			break
 		}
@@ -67,13 +68,19 @@ func startInteractiveSession() {
 		if line == "" {
 			continue
 		}
+		parsed, err := parseLineToJSONRPC(line)
+		if err != nil {
+			fmt.Println("❌ Error:", err)
+			continue
+		}
 		var js map[string]interface{}
-		if err := json.Unmarshal([]byte(line), &js); err != nil {
+		if err := json.Unmarshal([]byte(parsed), &js); err != nil {
 			fmt.Println("Invalid JSON:", err)
 			continue
 		}
 
-		_, err := inWriter.WriteString(line + "\n")
+		fmt.Println("sending parsed JSON:", parsed)
+		_, err = inWriter.WriteString(parsed + "\n")
 		if err != nil {
 			fmt.Println("Error writing to MCP:", err)
 			continue
@@ -90,5 +97,43 @@ func startInteractiveSession() {
 		json.Unmarshal(response, &pretty)
 		prettyBytes, _ := json.MarshalIndent(pretty, "", "  ")
 		fmt.Println(string(prettyBytes))
+	}
+}
+
+func parseLineToJSONRPC(line string) (string, error) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return "", nil
+	}
+	switch fields[0] {
+	case "list":
+		return `{"jsonrpc":"2.0","method":"tools/list","id":"1"}`, nil
+	case "call":
+		if len(fields) < 3 {
+			return "", fmt.Errorf("usage: call <toolName> <json input>")
+		}
+		tool := fields[1]
+		rest := strings.Join(fields[2:], " ")
+		var input map[string]interface{}
+		if err := json.Unmarshal([]byte(rest), &input); err != nil {
+			return "", fmt.Errorf("invalid JSON input: %w", err)
+		}
+		body := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"method":  "tools/call",
+			"id":      "2",
+			"params": map[string]interface{}{
+				"tool":  tool,
+				"input": input,
+			},
+		}
+		buf, err := json.Marshal(body)
+		if err != nil {
+			return "", err
+		}
+		return string(buf), nil
+	default:
+		// Treat it as raw JSON
+		return line, nil
 	}
 }
