@@ -241,7 +241,66 @@ func describeTool(toolName string) (string, error) {
 	fmt.Println("📥 Input Schema:")
 	describeProperties(tool.Schema, "", 1)
 	fmt.Println()
+
+	example := buildExampleFromTypes(tool.Schema)
+	fmt.Println("Input Example:")
+	fmt.Println(example)
+
+	fmt.Println("Input Example JSON:")
+	printExampleJSON(tool.Schema)
+
 	return "", nil // don't send anything to server
+}
+
+func printExampleJSON(schema map[string]interface{}) {
+	example := buildExampleFromSchema(schema, schema) // root = schema
+	bytes, err := json.MarshalIndent(example, "", "  ")
+	if err != nil {
+		fmt.Println("❌ Failed to marshal:", err)
+		return
+	}
+	fmt.Println("📦 Example request arguments:")
+	fmt.Println(string(bytes))
+}
+
+// buildExampleFromSchema recursively builds a mock object based on the input schema.
+func buildExampleFromSchema(schema map[string]interface{}, root map[string]interface{}) interface{} {
+	if ref, ok := schema["$ref"].(string); ok {
+		return buildExampleFromSchema(resolveRef(ref, root), root)
+	}
+
+	switch schema["type"] {
+	case "object":
+		obj := make(map[string]interface{})
+		if props, ok := schema["properties"].(map[string]interface{}); ok {
+			for key, val := range props {
+				propSchema := val.(map[string]interface{})
+				obj[key] = buildExampleFromSchema(propSchema, root)
+			}
+		}
+		return obj
+	case "array":
+		if items, ok := schema["items"].(map[string]interface{}); ok {
+			return []interface{}{buildExampleFromSchema(items, root)}
+		}
+		return []interface{}{}
+	case "string":
+		return "string"
+	case "integer":
+		return 0
+	case "number":
+		return 0.0
+	case "boolean":
+		if def, ok := schema["default"]; ok {
+			return def
+		}
+		return false
+	default:
+		if def, ok := schema["default"]; ok {
+			return def
+		}
+		return nil
+	}
 }
 
 func describeProperties(schema map[string]interface{}, prefix string, depth int) {
@@ -281,4 +340,78 @@ func describeProperties(schema map[string]interface{}, prefix string, depth int)
 			describeProperties(prop, fieldPath, depth+1)
 		}
 	}
+}
+
+func buildExampleFromTypes(schema map[string]interface{}) map[string]interface{} {
+	return buildExampleTyped(schema, schema)
+}
+
+func buildExampleTyped(schema map[string]interface{}, root map[string]interface{}) map[string]interface{} {
+	obj := map[string]interface{}{}
+	props, _ := schema["properties"].(map[string]interface{})
+
+	for name, raw := range props {
+		prop := raw.(map[string]interface{})
+
+		// Resolve $ref if needed
+		if ref, ok := prop["$ref"].(string); ok {
+			prop = resolveRef(ref, root)
+		}
+
+		typ, _ := prop["type"].(string)
+
+		// Handle enums
+		if enumList, ok := prop["enum"].([]interface{}); ok && len(enumList) > 0 {
+			obj[name] = enumList[0]
+			continue
+		}
+
+		switch typ {
+		case "string":
+			obj[name] = "string"
+		case "integer":
+			obj[name] = 0
+		case "boolean":
+			obj[name] = false
+		case "array":
+			items := prop["items"].(map[string]interface{})
+			itemType := items["type"].(string)
+			obj[name] = []interface{}{itemType}
+		case "object":
+			obj[name] = buildExampleTyped(prop, root)
+		default:
+			obj[name] = "any"
+		}
+	}
+
+	return obj
+}
+
+func resolveRef(ref string, root map[string]interface{}) map[string]interface{} {
+	if !strings.HasPrefix(ref, "#/") {
+		fmt.Printf("⚠️ unsupported ref format: %s\n", ref)
+		return map[string]interface{}{}
+	}
+
+	// Split path: e.g. "#/properties/value/properties/subject"
+	path := strings.Split(ref[2:], "/")
+	current := root
+	for i, part := range path {
+		unescaped := strings.ReplaceAll(part, "~1", "/")
+		unescaped = strings.ReplaceAll(unescaped, "~0", "~")
+
+		if next, ok := current[unescaped]; ok {
+			// If we're not at the end, continue walking
+			if m, ok := next.(map[string]interface{}); ok || i < len(path)-1 {
+				current = m
+			} else {
+				return map[string]interface{}{}
+			}
+		} else {
+			fmt.Printf("⚠️ ref path not found: %s (at %q)\n", ref, part)
+			return map[string]interface{}{}
+		}
+	}
+
+	return current
 }
