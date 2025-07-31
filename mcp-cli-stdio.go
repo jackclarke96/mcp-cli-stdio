@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"os/signal"
 	"strings"
 	"syscall"
 
@@ -17,18 +19,55 @@ type Tool struct {
 	Schema      map[string]interface{} `json:"inputSchema"`
 }
 
-var cachedTools = map[string]Tool{}
+var (
+	cachedTools  = map[string]Tool{}
+	childProcess *exec.Cmd
+)
 
 func main() {
+	var startCmd string
+
 	var rootCmd = &cobra.Command{
 		Use:   "mcp-cli",
 		Short: "Interactive CLI for MCP over stdio",
-		Run:   func(cmd *cobra.Command, args []string) { startInteractiveSession() },
+		Run: func(cmd *cobra.Command, args []string) {
+			if startCmd != "" {
+				go launchProcess(startCmd)
+			}
+			startInteractiveSession()
+		},
 	}
+
+	rootCmd.Flags().StringVar(&startCmd, "start-cmd", "", "Start command for the MCP server (e.g., 'node dist/index.js -e .env')")
+
+	// Handle Ctrl+C
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt)
+		<-c
+		if childProcess != nil && childProcess.Process != nil {
+			fmt.Println("\n🛑 Terminating subprocess...")
+			_ = childProcess.Process.Kill()
+		}
+		os.Exit(0)
+	}()
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println("Error:", err)
 		os.Exit(1)
+	}
+}
+
+func launchProcess(command string) {
+	childProcess = exec.Command("sh", "-c", command)
+	childProcess.Stdin, _ = os.Open("mcp.stdin")
+	childProcess.Stdout, _ = os.Create("mcp.stdout")
+	childProcess.Stderr = os.Stderr
+
+	fmt.Println("🚀 Starting MCP server with:", command)
+	if err := childProcess.Start(); err != nil {
+		fmt.Println("❌ Failed to start process:", err)
+		return
 	}
 }
 
@@ -42,9 +81,18 @@ func ensureFifo(path string) error {
 	return nil
 }
 
+func ensureFreshFifo(path string) error {
+	// Remove old pipe
+	if _, err := os.Stat(path); err == nil {
+		os.Remove(path)
+	}
+	// Create new pipe
+	return syscall.Mkfifo(path, 0600)
+}
+
 func startInteractiveSession() {
-	ensureFifo("mcp.stdin")
-	ensureFifo("mcp.stdout")
+	ensureFreshFifo("mcp.stdin")
+	ensureFreshFifo("mcp.stdout")
 
 	in, err := os.OpenFile("mcp.stdin", os.O_WRONLY, os.ModeNamedPipe)
 	if err != nil {
@@ -128,6 +176,7 @@ func startInteractiveSession() {
 		}
 	}
 }
+
 func parseLineToJSONRPC(line string) (string, error) {
 	fields := strings.Fields(line)
 	if len(fields) == 0 {
