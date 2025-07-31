@@ -4,11 +4,11 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
-	"syscall"
 
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
@@ -31,14 +31,17 @@ func main() {
 		Use:   "mcp-cli",
 		Short: "Interactive CLI for MCP over stdio",
 		Run: func(cmd *cobra.Command, args []string) {
+			stdinR, stdinW := io.Pipe()
+			stdoutR, stdoutW := io.Pipe()
+
 			if startCmd != "" {
-				go launchProcess(startCmd)
+				go launchProcess(startCmd, stdinR, stdoutW)
 			}
-			startInteractiveSession()
+			startInteractiveSession(stdinW, stdoutR)
 		},
 	}
 
-	rootCmd.Flags().StringVar(&startCmd, "start-cmd", "", "Start command for the MCP server (e.g., 'node dist/index.js -e .env')")
+	rootCmd.Flags().StringVar(&startCmd, "start-cmd", "", "Start command for the MCP server (e.g., 'node dist/index.js -e .env' or docker command)")
 
 	// Handle Ctrl+C
 	go func() {
@@ -46,7 +49,7 @@ func main() {
 		signal.Notify(c, os.Interrupt)
 		<-c
 		if childProcess != nil && childProcess.Process != nil {
-			fmt.Println("\n🛑 Terminating subprocess...")
+			fmt.Println("\n🚑 Terminating subprocess...")
 			_ = childProcess.Process.Kill()
 		}
 		os.Exit(0)
@@ -58,10 +61,10 @@ func main() {
 	}
 }
 
-func launchProcess(command string) {
+func launchProcess(command string, stdin io.Reader, stdout io.Writer) {
 	childProcess = exec.Command("sh", "-c", command)
-	childProcess.Stdin, _ = os.Open("mcp.stdin")
-	childProcess.Stdout, _ = os.Create("mcp.stdout")
+	childProcess.Stdin = stdin
+	childProcess.Stdout = stdout
 	childProcess.Stderr = os.Stderr
 
 	fmt.Println("🚀 Starting MCP server with:", command)
@@ -71,45 +74,9 @@ func launchProcess(command string) {
 	}
 }
 
-func ensureFifo(path string) error {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		err := syscall.Mkfifo(path, 0600)
-		if err != nil {
-			return fmt.Errorf("failed to create fifo %s: %w", path, err)
-		}
-	}
-	return nil
-}
-
-func ensureFreshFifo(path string) error {
-	// Remove old pipe
-	if _, err := os.Stat(path); err == nil {
-		os.Remove(path)
-	}
-	// Create new pipe
-	return syscall.Mkfifo(path, 0600)
-}
-
-func startInteractiveSession() {
-	ensureFreshFifo("mcp.stdin")
-	ensureFreshFifo("mcp.stdout")
-
-	in, err := os.OpenFile("mcp.stdin", os.O_WRONLY, os.ModeNamedPipe)
-	if err != nil {
-		fmt.Println("Failed to open stdin:", err)
-		return
-	}
-	defer in.Close()
-
-	out, err := os.Open("mcp.stdout")
-	if err != nil {
-		fmt.Println("Failed to open stdout:", err)
-		return
-	}
-	defer out.Close()
-
-	inWriter := json.NewEncoder(in)
-	outReader := json.NewDecoder(out)
+func startInteractiveSession(writer io.Writer, reader io.Reader) {
+	inWriter := json.NewEncoder(writer)
+	outReader := json.NewDecoder(reader)
 	liner := liner.NewLiner()
 	defer liner.Close()
 	liner.SetCtrlCAborts(true)
