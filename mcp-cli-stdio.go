@@ -14,14 +14,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var initialized bool
+
 type Tool struct {
 	Description string                 `json:"description"`
 	Schema      map[string]interface{} `json:"inputSchema"`
 }
 
 var (
-	cachedTools  = map[string]Tool{}
-	childProcess *exec.Cmd
+	cachedTools   = map[string]Tool{}
+	childProcess  *exec.Cmd
+	responseQueue = make(chan map[string]interface{}, 10)
 )
 
 func main() {
@@ -31,13 +34,16 @@ func main() {
 		Use:   "mcp-cli",
 		Short: "Interactive CLI for MCP over stdio",
 		Run: func(cmd *cobra.Command, args []string) {
-			stdinR, stdinW := io.Pipe()
-			stdoutR, stdoutW := io.Pipe()
-
 			if startCmd != "" {
-				go launchProcess(startCmd, stdinR, stdoutW)
+				stdin, stdout, err := launchProcess(startCmd)
+				if err != nil {
+					fmt.Println("❌ Failed to start:", err)
+					return
+				}
+				startInteractiveSession(stdin, stdout)
+			} else {
+				fmt.Println("❌ No --start-cmd provided")
 			}
-			startInteractiveSession(stdinW, stdoutR)
 		},
 	}
 
@@ -61,30 +67,57 @@ func main() {
 	}
 }
 
-func launchProcess(command string, stdin io.Reader, stdout io.Writer) {
-	childProcess = exec.Command("sh", "-c", command)
-	childProcess.Stdin = stdin
-	childProcess.Stdout = stdout
-	childProcess.Stderr = os.Stderr
+func launchProcess(command string) (io.WriteCloser, io.ReadCloser, error) {
+	cmd := exec.Command("sh", "-c", command)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("stdin pipe error: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("stdout pipe error: %w", err)
+	}
+	cmd.Stderr = os.Stderr
 
 	fmt.Println("🚀 Starting MCP server with:", command)
-	if err := childProcess.Start(); err != nil {
-		fmt.Println("❌ Failed to start process:", err)
-		return
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("start failed: %w", err)
 	}
+
+	childProcess = cmd
+	return stdin, stdout, nil
 }
 
 func startInteractiveSession(writer io.Writer, reader io.Reader) {
 	inWriter := json.NewEncoder(writer)
-	outReader := json.NewDecoder(reader)
-	liner := liner.NewLiner()
-	defer liner.Close()
-	liner.SetCtrlCAborts(true)
+	bufReader := bufio.NewReader(reader)
+	rl := liner.NewLiner()
+	defer rl.Close()
+	rl.SetCtrlCAborts(true)
+
+	// Decode one JSON object at a time from server stdout
+	go func() {
+		dec := json.NewDecoder(bufReader)
+		for {
+			var msg map[string]interface{}
+			if err := dec.Decode(&msg); err != nil {
+				if err == io.EOF {
+					fmt.Println("❌ MCP stream closed:", err)
+					close(responseQueue)
+					return
+				}
+				fmt.Println("📝 Non-JSON or decode error:", err)
+				continue
+			}
+			responseQueue <- msg
+		}
+	}()
 
 	fmt.Println("MCP CLI started. Type JSON-RPC messages / Ctrl + C to exit")
 
 	for {
-		line, err := liner.Prompt("> ")
+		line, err := rl.Prompt("> ")
 		if err != nil {
 			break
 		}
@@ -92,7 +125,7 @@ func startInteractiveSession(writer io.Writer, reader io.Reader) {
 		if line == "" {
 			continue
 		}
-		liner.AppendHistory(line)
+		rl.AppendHistory(line)
 
 		parsed, err := parseLineToJSONRPC(line)
 		if err != nil {
@@ -115,16 +148,44 @@ func startInteractiveSession(writer io.Writer, reader io.Reader) {
 			continue
 		}
 
-		var pretty map[string]interface{}
-		if err := outReader.Decode(&pretty); err != nil {
-			fmt.Println("Error reading from MCP:", err)
+		// 🔔 If this is a notification (no "id"), do NOT wait for a response
+		if _, hasID := js["id"]; !hasID {
+			fmt.Println("↪ sent notification (no response expected)")
 			continue
 		}
+
+		// Wait for the next JSON response
+		msg, ok := <-responseQueue
+		if !ok {
+			fmt.Println("❌ Lost connection to MCP process")
+			return
+		}
+
 		fmt.Println("Response:")
-		prettyBytes, _ := json.MarshalIndent(pretty, "", "  ")
+		prettyBytes, _ := json.MarshalIndent(msg, "", "  ")
 		fmt.Println(string(prettyBytes))
 
-		if result, ok := pretty["result"]; ok {
+		// If we just initialized successfully, complete the handshake by sending notifications/initialized
+		if method, _ := js["method"].(string); method == "initialize" {
+			if msg["error"] == nil {
+				initialized = true
+				fmt.Println("✅ initialized (manual)")
+				notif := map[string]interface{}{
+					"jsonrpc": "2.0",
+					"method":  "notifications/initialized",
+					"params":  map[string]interface{}{},
+				}
+				if err := inWriter.Encode(notif); err != nil {
+					fmt.Println("⚠️ failed to send notifications/initialized:", err)
+				} else {
+					fmt.Println("🔔 sent notifications/initialized")
+				}
+			} else {
+				fmt.Println("❌ initialize failed")
+			}
+		}
+
+		if result, ok := msg["result"]; ok {
 			if tools, ok := result.(map[string]interface{})["tools"].([]interface{}); ok {
 				cachedTools = map[string]Tool{}
 				for _, t := range tools {
@@ -151,6 +212,34 @@ func parseLineToJSONRPC(line string) (string, error) {
 	}
 
 	switch fields[0] {
+
+	case "init":
+		protocol := "2024-11-05"
+		if len(fields) >= 2 {
+			protocol = fields[1]
+		}
+		req := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      "init-manual",
+			"method":  "initialize",
+			"params": map[string]interface{}{
+				"clientInfo":      map[string]interface{}{"name": "mcp-cli", "version": "0.1.0"},
+				"protocolVersion": protocol,
+				"capabilities":    map[string]interface{}{}, // required by your server
+			},
+		}
+		b, _ := json.Marshal(req)
+		return string(b), nil
+
+	case "initialized":
+		req := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"method":  "notifications/initialized",
+			"params":  map[string]interface{}{},
+		}
+		b, _ := json.Marshal(req)
+		return string(b), nil
+
 	case "list":
 		if len(fields) > 1 && fields[1] == "--name-only" {
 			if len(cachedTools) == 0 {
